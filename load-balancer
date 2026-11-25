@@ -134,7 +134,9 @@ def create_task(record, targets, now=None):
 def task_action(seat, action, tid, now=None):
     """claim, release or done on a task for `seat`. Returns a line to show; ValueError if refused.
 
-    claim: only when nobody holds it (or `seat` already does). release: the
+    claim: only when nobody holds it (or `seat` already does), only by one of
+    the seats the note went to, and only while that seat can take work
+    (ready, busy or stuck; not spent, away or disconnected). release: the
     holder gives it up, and it goes to the next most available candidate.
     done: the holder (or the owner) closes it.
     """
@@ -151,6 +153,13 @@ def task_action(seat, action, tid, now=None):
             if holder and holder != seat:
                 raise ValueError(f"{tid} is {holder}'s since {deck.when(task['since'])}. Don't start it; "
                                  f"ask {holder}, or wait for it to be released.")
+            if seat not in task["candidates"]:
+                raise ValueError(f"{tid} went to {', '.join(task['candidates'])}, not {seat}; "
+                                 f"leave it to them.")
+            word = deck.availability(seat, deck.load_seat(seat)["state"], now)["word"]
+            if holder != seat and deck.AVAILABILITY.get(word, 6) > deck.AVAILABILITY["stuck"]:
+                raise ValueError(f"{seat} is {word} now, so it can't take {tid}; "
+                                 f"it stays with whoever is free.")
             task.update(holder=seat, state="held", since=now, lease_until=now + TASK_LEASE, reminded=False)
             _task_event(task, "claimed", seat, now)
             result = f"{tid} is yours: {task['summary']}"
@@ -336,6 +345,15 @@ def self_test():
     t4 = load_task(r4["task"])
     check("with nobody free the task is open, and says claim_task",
           t4["state"] == "open" and "claim_task" in d.render([r4], "claude"), t4)
+    for seat, why in (("vibe", "a seat the note didn't go to"), ("claude", "a spent candidate")):
+        try:
+            task_action(seat, "claim", t4["id"])
+            check(f"a claim by {why} is refused", False, "accepted")
+        except ValueError as error:
+            check(f"a claim by {why} is refused", seat in str(error), error)
+    d.mark_spent("claude", "clear", "claude")
+    print(task_action("claude", "claim", t4["id"]))
+    check("a free candidate can claim an open task", load_task(t4["id"])["holder"] == "claude", load_task(t4["id"]))
     print("\n" + ("all passed" if not failures else f"{len(failures)} failed"))
     return 1 if failures else 0
 
