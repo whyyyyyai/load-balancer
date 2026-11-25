@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""load-balancer: the task board for comms-deck. One task, one holder.
+
+READ THIS FIRST
+  The owner runs a team of AI agents that talk through comms-deck
+  (https://github.com/whyyyyyai/comms-deck). When the owner asked several
+  agents for something at once, two or three of them picked it up, because
+  each one decided for itself and a claim was just another note, delivered
+  late. On 2026-11-25 that produced four pairs of duplicate pull requests.
+
+  This program makes that decision instead of the agents:
+
+  - A note from the owner to two or more agent seats becomes a task (t1,
+    t2, ...) with ONE holder: the most available of those seats, using the
+    deck's own availability ranking (ready, then busy, then stuck; fewer
+    notes waiting first). The note each agent receives says who holds it.
+  - A second claim is refused: "t42 is vibe's since 02:37".
+  - The holder keeps the task while it's busy. A holder that goes spent,
+    away or not connected loses it at once. A holder sitting idle past the
+    lease (30 minutes) gets one reminder, then loses it a lease later. The
+    task goes to the next most available seat, which is told.
+  - `done_task` closes it. `release_task` hands it on.
+
+  It is plain, deterministic code: no AI, no network. It runs inside
+  comms-deck: the deck loads this file at start (from
+  ~/.local/bin/load-balancer) and calls attach() with itself, so the board
+  uses the deck's mailbox, notes and ranking and never copies them. If this
+  file is missing or broken, the deck carries on exactly as before.
+
+  Files: <comms-deck data>/tasks/t<N>.json, one per task, and tasks/.lock,
+  which serialises every change.
+
+USE
+  Agents use the deck's MCP tools: tasks, claim_task, release_task,
+  done_task. From a shell (it loads ~/.local/bin/comms-deck itself):
+
+    load-balancer tasks [--all]           the board
+    load-balancer claim|release|done <id> --as <seat>
+    load-balancer tick                    one maintenance pass (the deck's
+                                          service runs this every 30 s)
+    load-balancer self-test               checks, on a throwaway data folder
+
+Written by: Claude (2026-11-25), at the owner's request. The idea of a
+load balancer that also routes reviews is Lumo's spec (comms-deck #40).
+"""
+import fcntl
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+deck = None          # the comms-deck module, set by attach()
+TASKS = None         # <deck data>/tasks
+
+
+def attach(module):
+    """Bind this board to a loaded comms-deck module. comms-deck calls this when it loads us."""
+    global deck, TASKS
+    deck = module
+    TASKS = Path(module.DATA) / "tasks"
+    try:
+        globals()["TASK_LEASE"] = int(module.setting("TASK_LEASE", str(TASK_LEASE)))
+    except ValueError:
+        pass
+
+
+TASK_LEASE = 1800  # idle this long: a reminder; as long again: reassigned
+TASK_ACTIVE = ("held", "open")
+
+
+class _TaskLock:
+    """`with _TaskLock():` holds the board's lock, so two changes can't interleave."""
+
+    def __enter__(self):
+        TASKS.mkdir(parents=True, exist_ok=True)
+        self.f = open(TASKS / ".lock", "a")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def load_task(tid):
+    """One task as a dict, or None."""
+    return deck.read_json(TASKS / f"{tid}.json") if re.fullmatch(r"t\d+", str(tid or "")) else None
+
+
+def all_tasks():
+    """Every task, oldest first."""
+    found = [deck.read_json(p) for p in TASKS.glob("t*.json")] if TASKS.exists() else []
+    return sorted((t for t in found if t), key=lambda t: int(t["id"][1:]))
+
+
+def pick_holder(candidates, exclude=(), now=None):
+    """The most available candidate that can take work now (ready, busy or stuck), or None."""
+    ranked = [(deck.availability(s, deck.load_seat(s)["state"], now)["rank"], i, s)
+              for i, s in enumerate(candidates) if s in deck.AGENTS and s not in exclude]
+    usable = [r for r in ranked if r[0][0] <= deck.AVAILABILITY["stuck"]]
+    return min(usable)[2] if usable else None
+
+
+def _task_event(task, what, seat=None, now=None):
+    """Record a change on the task (kept in the file, for the record)."""
+    task.setdefault("history", []).append([now or time.time(), what, seat])
+
+
+def create_task(record, targets, now=None):
+    """Make a task from the owner's note to several agents. Returns it, or None.
+
+    Only a note to two or more agent seats becomes a task: a note to one seat
+    is already that seat's. Notes that are only @deck lines are left alone.
+    """
+    candidates = [s for s in targets if s in deck.AGENTS]
+    if len(candidates) < 2 or not deck.DECK_LINE.sub("", record["text"]).strip():
+        return None
+    now = time.time() if now is None else now
+    with _TaskLock():
+        n = 1 + max([int(t["id"][1:]) for t in all_tasks()] or [0])
+        holder = pick_holder(candidates, now=now)
+        task = {"id": f"t{n}", "note": record["id"], "from": record["from"],
+                "summary": deck.describe(record["text"]), "private": record.get("private", False),
+                "created": now, "candidates": candidates, "holder": holder,
+                "state": "held" if holder else "open", "since": now,
+                "lease_until": now + TASK_LEASE, "reminded": False}
+        _task_event(task, "assigned" if holder else "open", holder, now)
+        deck.write_json(TASKS / f"{task['id']}.json", task)
+    return task
+
+
+def task_action(seat, action, tid, now=None):
+    """claim, release or done on a task for `seat`. Returns a line to show; ValueError if refused.
+
+    claim: only when nobody holds it (or `seat` already does). release: the
+    holder gives it up, and it goes to the next most available candidate.
+    done: the holder (or the owner) closes it.
+    """
+    now = time.time() if now is None else now
+    handed = None
+    with _TaskLock():
+        task = load_task(tid)
+        if not task:
+            raise ValueError(f"no task {tid!r}; `tasks` lists them")
+        holder = task.get("holder")
+        if task["state"] == "done":
+            raise ValueError(f"{tid} is already done")
+        if action == "claim":
+            if holder and holder != seat:
+                raise ValueError(f"{tid} is {holder}'s since {deck.when(task['since'])}. Don't start it; "
+                                 f"ask {holder}, or wait for it to be released.")
+            task.update(holder=seat, state="held", since=now, lease_until=now + TASK_LEASE, reminded=False)
+            _task_event(task, "claimed", seat, now)
+            result = f"{tid} is yours: {task['summary']}"
+        elif action in ("release", "done"):
+            if seat not in (holder, "owner"):
+                raise ValueError(f"{tid} is {holder or 'nobody'}'s, not yours")
+            if action == "done":
+                task.update(state="done", since=now)
+                _task_event(task, "done", seat, now)
+                result = f"{tid} is done."
+            else:
+                handed = pick_holder(task["candidates"], exclude=(seat,), now=now)
+                task.update(holder=handed, state="held" if handed else "open", since=now,
+                            lease_until=now + TASK_LEASE, reminded=False)
+                _task_event(task, "released", seat, now)
+                _task_event(task, "assigned" if handed else "open", handed, now)
+                result = f"{tid} released; " + (f"it's {handed}'s now." if handed else "nobody is free, so it's open.")
+        else:
+            raise ValueError(f"unknown task action {action!r}: claim, release or done")
+        deck.write_json(TASKS / f"{tid}.json", task)
+    if handed:
+        tell_holder(task, f"{tid} has been handed to you, released by {seat}")
+    return result
+
+
+def tell_holder(task, why):
+    """A note from the deck to a task's new holder."""
+    deck.send("deck", task["holder"], f"{why}: {task['summary']} (from {task['from']}, "
+         f"note at {deck.when(task['created'])}). It's yours alone: `done_task {task['id']}` when it's "
+         f"finished, `release_task {task['id']}` if you can't do it.")
+
+
+def refresh_tasks(now=None):
+    """Keep every task with someone who can do it. Run by the service.
+
+    A busy holder keeps its lease. A holder that is spent, away or not
+    connected loses the task at once. A holder sitting idle past the lease
+    gets one reminder, then loses it one lease later. An open task goes to
+    the first candidate who becomes free.
+    """
+    now = time.time() if now is None else now
+    for task in [t for t in all_tasks() if t["state"] in TASK_ACTIVE]:
+        handed, reminder = None, False
+        with _TaskLock():
+            task = load_task(task["id"])
+            if not task or task["state"] not in TASK_ACTIVE:
+                continue
+            holder = task.get("holder")
+            word = deck.availability(holder, deck.load_seat(holder)["state"], now)["word"] if holder else None
+            if holder and word == "busy":
+                task.update(lease_until=now + TASK_LEASE, reminded=False)
+            elif holder and deck.AVAILABILITY.get(word, 6) <= deck.AVAILABILITY["stuck"]:
+                if now < task["lease_until"]:
+                    pass
+                elif not task.get("reminded"):
+                    task.update(reminded=True, lease_until=now + TASK_LEASE)
+                    reminder = True
+                else:
+                    holder = None  # reminded a lease ago and still idle: hand it on
+            else:
+                holder = None
+            if holder is None:
+                old = task.get("holder")
+                handed = pick_holder(task["candidates"], exclude=(old,) if old else (), now=now)
+                if handed or old:
+                    task.update(holder=handed, state="held" if handed else "open", since=now,
+                                lease_until=now + TASK_LEASE, reminded=False)
+                    _task_event(task, "reassigned" if handed else "open", handed, now)
+                    if not handed:
+                        deck.log(f"task {task['id']}: {old} can't hold it and nobody else is free; open")
+            deck.write_json(TASKS / f"{task['id']}.json", task)
+        if handed:
+            tell_holder(task, f"{task['id']} has been handed to you (its holder can't take it now)")
+        elif reminder:
+            deck.send("deck", task["holder"], f"{task['id']} is still yours: {task['summary']}. "
+                 f"`done_task {task['id']}` if it's finished, `release_task {task['id']}` if not. "
+                 f"It moves to someone else in {TASK_LEASE // 60} minutes otherwise.", quiet=False)
+
+
+def tasks_text(active_only=True):
+    """The board as lines of text: one per task."""
+    rows = []
+    for t in all_tasks():
+        if active_only and t["state"] not in TASK_ACTIVE:
+            continue
+        who = t.get("holder") or "open"
+        summary = "(private)" if t.get("private") else t["summary"]
+        rows.append(f"{t['id']:5} {t['state']:5} {who:8} since {deck.when(t['since'])}  {summary}")
+    return "\n".join(rows) if rows else "No open tasks."
+
+
+# -----------------------------------------------------------------------------
+# Standalone: load comms-deck ourselves, then the CLI and the self-test.
+# -----------------------------------------------------------------------------
+
+def load_deck(path=None):
+    """Load comms-deck from `path` ($COMMS_DECK, else ~/.local/bin/comms-deck) and attach to it."""
+    import importlib.machinery
+    import importlib.util
+    path = Path(path or os.environ.get("COMMS_DECK") or Path.home() / ".local/bin/comms-deck")
+    loader = importlib.machinery.SourceFileLoader("comms_deck", str(path))
+    spec = importlib.util.spec_from_loader("comms_deck", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    attach(module)
+    module._balancer = sys.modules[__name__]  # the deck uses this copy, not a second one
+    return module
+
+
+def self_test():
+    """Run the board through its cases on a throwaway data folder. Exit 1 on any failure."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="load-balancer-test-")
+    os.environ.update(COMMS_DECK_HOME=f"{tmp}/data", COMMS_DECK_CONFIG=f"{tmp}/config")
+    os.environ.pop("COMMS_DECK_SEAT", None)
+    d = load_deck()
+    failures = []
+
+    def check(name, ok, detail=""):
+        print(("ok   " if ok else "FAIL ") + name)
+        if not ok:
+            failures.append(name)
+            print("     " + str(detail))
+
+    d.notify = lambda *a, **k: None  # no desktop pop-ups from a test
+    for seat in ("claude", "grok", "vibe"):
+        d.update_seat(seat, state="idle")
+    rec, _ = d.send("owner", "claude, grok", "fix the panel")
+    task = load_task(rec.get("task"))
+    check("an owner note to two agents becomes a task with one holder",
+          task and task["holder"] in ("claude", "grok") and task["state"] == "held", task)
+    holder = task["holder"]
+    other = "grok" if holder == "claude" else "claude"
+    try:
+        task_action(other, "claim", task["id"])
+        check("a second claim is refused", False, "accepted")
+    except ValueError as error:
+        check("a second claim is refused, naming the holder", holder in str(error), error)
+    mine = d.render([rec], holder)
+    theirs = d.render([rec], other)
+    check("the holder's note says it's theirs; the other's says don't start it",
+          "is YOURS" in mine and f"is {holder}'s. Don't start it" in theirs, theirs)
+    check("the team snapshot lists the board", f"Tasks: {task['id']} {holder}" in theirs, theirs)
+    for p in (Path(tmp) / "data/inbox").glob("*/*.json"):
+        p.unlink()
+    print(task_action(holder, "release", task["id"]))
+    task = load_task(task["id"])
+    told = [json.loads(p.read_text()) for p in (Path(tmp) / f"data/inbox/{other}").glob("*.json")]
+    check("release hands it to the other candidate, who is told",
+          task["holder"] == other and any(task["id"] in r["text"] and r["from"] == "deck" for r in told), task)
+    d.mark_spent(other, "+2h", "claude")
+    refresh_tasks()
+    task = load_task(task["id"])
+    check("a spent holder loses the task to a free candidate", task["holder"] == holder, task)
+    d.mark_spent(other, "clear", "claude")
+    task["lease_until"] = time.time() - 1
+    deck.write_json(TASKS / f"{task['id']}.json", task)
+    refresh_tasks()
+    task = load_task(task["id"])
+    check("an idle holder past the lease is reminded first", task["holder"] == holder and task["reminded"], task)
+    task["lease_until"] = time.time() - 1
+    deck.write_json(TASKS / f"{task['id']}.json", task)
+    refresh_tasks()
+    task = load_task(task["id"])
+    check("...and loses it a lease later", task["holder"] == other, task)
+    d.update_seat(other, state="busy")
+    task["lease_until"] = time.time() - 1
+    deck.write_json(TASKS / f"{task['id']}.json", task)
+    refresh_tasks()
+    check("a busy holder keeps it, lease renewed",
+          load_task(task["id"])["holder"] == other and load_task(task["id"])["lease_until"] > time.time())
+    print(task_action(other, "done", task["id"]))
+    check("done closes it and it leaves the board",
+          load_task(task["id"])["state"] == "done" and tasks_text() == "No open tasks.", tasks_text())
+    r1, _ = d.send("owner", "claude", "just for you")
+    r2, _ = d.send("owner", "claude, grok", "@deck scratchpad")
+    r3, _ = d.send("grok", "claude, vibe", "from an agent")
+    check("no task for a note to one seat, an @deck-only note, or an agent's note",
+          not r1.get("task") and not r2.get("task") and not r3.get("task"), [r1.get("task"), r2.get("task"), r3.get("task")])
+    for seat in ("claude", "grok"):
+        d.mark_spent(seat, "+2h", "claude")
+    r4, _ = d.send("owner", "claude, grok", "nobody free")
+    t4 = load_task(r4["task"])
+    check("with nobody free the task is open, and says claim_task",
+          t4["state"] == "open" and "claim_task" in d.render([r4], "claude"), t4)
+    print("\n" + ("all passed" if not failures else f"{len(failures)} failed"))
+    return 1 if failures else 0
+
+
+def main(argv):
+    """The command line."""
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if argv[0] == "self-test":
+        return self_test()
+    load_deck()
+    if argv[0] == "tasks":
+        print(tasks_text(active_only="--all" not in argv))
+    elif argv[0] == "tick":
+        refresh_tasks()
+    elif argv[0] in ("claim", "release", "done") and len(argv) >= 2:
+        seat = argv[argv.index("--as") + 1] if "--as" in argv else (deck.find_agent()[0] or "owner")
+        try:
+            print(task_action(seat, argv[0], argv[1]))
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return 1
+    else:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
