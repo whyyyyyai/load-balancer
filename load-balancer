@@ -67,6 +67,7 @@ def attach(module):
 
 
 TASK_LEASE = 1800  # idle this long: a reminder; as long again: reassigned
+JOIN_SECONDS = 90.0  # the owner's rapid lines to the same seats are one task
 TASK_ACTIVE = ("held", "open")
 
 
@@ -113,17 +114,32 @@ def create_task(record, targets, now=None):
 
     Only a note to two or more agent seats becomes a task: a note to one seat
     is already that seat's. Notes that are only @deck lines are left alone.
+    The owner often sends one thought as several quick lines; a line to the
+    same seats within JOIN_SECONDS of the last one joins that task instead of
+    starting another (Y, 2026-11-27: twelve lines became t31-t42).
     """
     candidates = [s for s in targets if s in deck.AGENTS]
     if len(candidates) < 2 or not deck.DECK_LINE.sub("", record["text"]).strip():
         return None
     now = time.time() if now is None else now
     with _TaskLock():
+        for task in all_tasks():
+            if (task.get("state") in TASK_ACTIVE and task.get("from") == "owner"
+                    and set(task.get("candidates") or []) == set(candidates)
+                    and bool(task.get("private")) == bool(record.get("private"))
+                    and now - float(task.get("last", task.get("created", 0))) <= JOIN_SECONDS):
+                notes = task.setdefault("notes", [task["note"]] if task.get("note") else [])
+                if record["id"] not in notes:
+                    notes.append(record["id"])
+                task["last"] = now
+                _task_event(task, "joined", None, now)
+                deck.write_json(TASKS / f"{task['id']}.json", task)
+                return task
         n = 1 + max([int(t["id"][1:]) for t in all_tasks()] or [0])
         holder = pick_holder(candidates, now=now)
-        task = {"id": f"t{n}", "note": record["id"], "from": record["from"],
+        task = {"id": f"t{n}", "note": record["id"], "notes": [record["id"]], "from": record["from"],
                 "summary": deck.describe(record["text"]), "private": record.get("private", False),
-                "created": now, "candidates": candidates, "holder": holder,
+                "created": now, "last": now, "candidates": candidates, "holder": holder,
                 "state": "held" if holder else "open", "since": now,
                 "lease_until": now + TASK_LEASE, "reminded": False}
         _task_event(task, "assigned" if holder else "open", holder, now)
@@ -367,6 +383,21 @@ def self_test():
     d.mark_spent("claude", "clear", "claude")
     print(task_action("claude", "claim", t4["id"]))
     check("a free candidate can claim an open task", load_task(t4["id"])["holder"] == "claude", load_task(t4["id"]))
+    r5, _ = d.send("owner", "grok, vibe", "first half of one thought")
+    r6, _ = d.send("owner", "grok, vibe", "second half of one thought")
+    t5 = load_task(r5.get("task"))
+    check("rapid owner lines to the same seats join one task",
+          r6.get("task") == r5.get("task") and t5 and t5.get("notes") == [r5["id"], r6["id"]],
+          (r5.get("task"), r6.get("task"), t5))
+    r7, _ = d.send("owner", "claude, vibe", "a different set of seats")
+    check("the same quick line to different seats still gets its own task",
+          r7.get("task") and r7["task"] != r5.get("task"), r7.get("task"))
+    t5 = load_task(r5["task"])
+    t5["last"] = time.time() - JOIN_SECONDS - 1
+    deck.write_json(TASKS / f"{t5['id']}.json", t5)
+    r8, _ = d.send("owner", "grok, vibe", "the same seats, later")
+    check("after the join window the same seats get a new task",
+          r8.get("task") and r8["task"] != r5.get("task"), (r5.get("task"), r8.get("task")))
     print("\n" + ("all passed" if not failures else f"{len(failures)} failed"))
     return 1 if failures else 0
 
