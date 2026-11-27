@@ -171,7 +171,13 @@ def task_action(seat, action, tid, now=None):
                 _task_event(task, "done", seat, now)
                 result = f"{tid} is done."
             else:
-                handed = pick_holder(task["candidates"], exclude=(seat,), now=now)
+                # Exclude the task's holder, not the releaser: the holder may
+                # not take the task straight back. A holder-initiated release
+                # already excludes itself this way (seat == holder); for an
+                # owner release it stops the same holder being re-picked
+                # (reproduced: claude released by the owner and handed back
+                # to claude). (Devin's review finding, load-balancer PR #1.)
+                handed = pick_holder(task["candidates"], exclude=(holder,) if holder else (), now=now)
                 task.update(holder=handed, state="held" if handed else "open", since=now,
                             lease_until=now + TASK_LEASE, reminded=False)
                 _task_event(task, "released", seat, now)
@@ -310,6 +316,13 @@ def self_test():
     told = [json.loads(p.read_text()) for p in (Path(tmp) / f"data/inbox/{other}").glob("*.json")]
     check("release hands it to the other candidate, who is told",
           task["holder"] == other and any(task["id"] in r["text"] and r["from"] == "deck" for r in told), task)
+    for p in (Path(tmp) / "data/inbox").glob("*/*.json"):
+        p.unlink()
+    print(task_action("owner", "release", task["id"]))
+    task = load_task(task["id"])
+    told = [json.loads(p.read_text()) for p in (Path(tmp) / f"data/inbox/{holder}").glob("*.json")]
+    check("an owner release hands the task on instead of re-picking its holder",
+          task["holder"] == holder and any(task["id"] in r["text"] and r["from"] == "deck" for r in told), task)
     d.mark_spent(other, "+2h", "claude")
     refresh_tasks()
     task = load_task(task["id"])
