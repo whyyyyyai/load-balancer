@@ -49,6 +49,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 deck = None          # the comms-deck module, set by attach()
@@ -96,12 +97,22 @@ def all_tasks():
     return sorted((t for t in found if t), key=lambda t: int(t["id"][1:]))
 
 
-def pick_holder(candidates, exclude=(), now=None):
-    """The most available candidate that can take work now (ready, busy or stuck), or None."""
-    ranked = [(deck.availability(s, deck.load_seat(s)["state"], now)["rank"], i, s)
-              for i, s in enumerate(candidates) if s in deck.AGENTS and s not in exclude]
-    usable = [r for r in ranked if r[0][0] <= deck.AVAILABILITY["stuck"]]
-    return min(usable)[2] if usable else None
+def pick_holder(candidates, exclude=(), now=None, tasks=None):
+    """Prefer an eligible seat with room for new work. Call under the board lock."""
+    if tasks is None:
+        tasks = all_tasks()
+    held = Counter(task.get("holder") for task in tasks if task["state"] == "held")
+    ranked = []
+    for order, seat in enumerate(candidates):
+        if seat not in deck.AGENTS or seat in exclude:
+            continue
+        availability = deck.availability(seat, deck.load_seat(seat)["state"], now)
+        level, waiting = availability["rank"]
+        if level > deck.AVAILABILITY["stuck"]:
+            continue
+        occupied = availability["word"] == "busy" or held[seat] > 0
+        ranked.append((occupied, held[seat], level, waiting, order, seat))
+    return min(ranked)[-1] if ranked else None
 
 
 def _task_event(task, what, seat=None, now=None):
@@ -116,14 +127,19 @@ def create_task(record, targets, now=None):
     is already that seat's. Notes that are only @deck lines are left alone.
     The owner often sends one thought as several quick lines; a line to the
     same seats within JOIN_SECONDS of the last one joins that task instead of
-    starting another (Y, 2026-11-27: twelve lines became t31-t42).
+    starting another. A leading @task starts separate work immediately.
     """
     candidates = [s for s in targets if s in deck.AGENTS]
-    if len(candidates) < 2 or not deck.DECK_LINE.sub("", record["text"]).strip():
+    message = deck.DECK_LINE.sub("", record["text"]).strip()
+    new_task = re.match(r"^@task(?:\s+|$)", message, re.IGNORECASE)
+    if new_task:
+        message = message[new_task.end():]
+    if len(candidates) < 2 or not message:
         return None
     now = time.time() if now is None else now
     with _TaskLock():
-        for task in all_tasks():
+        tasks = all_tasks()
+        for task in reversed(tasks) if not new_task else ():
             if (task.get("state") in TASK_ACTIVE and task.get("from") == "owner"
                     and set(task.get("candidates") or []) == set(candidates)
                     and bool(task.get("private")) == bool(record.get("private"))
@@ -135,10 +151,10 @@ def create_task(record, targets, now=None):
                 _task_event(task, "joined", None, now)
                 deck.write_json(TASKS / f"{task['id']}.json", task)
                 return task
-        n = 1 + max([int(t["id"][1:]) for t in all_tasks()] or [0])
-        holder = pick_holder(candidates, now=now)
+        n = 1 + max([int(t["id"][1:]) for t in tasks] or [0])
+        holder = pick_holder(candidates, now=now, tasks=tasks)
         task = {"id": f"t{n}", "note": record["id"], "notes": [record["id"]], "from": record["from"],
-                "summary": deck.describe(record["text"]), "private": record.get("private", False),
+                "summary": deck.describe(message), "private": record.get("private", False),
                 "created": now, "last": now, "candidates": candidates, "holder": holder,
                 "state": "held" if holder else "open", "since": now,
                 "lease_until": now + TASK_LEASE, "reminded": False}
@@ -398,6 +414,24 @@ def self_test():
     r8, _ = d.send("owner", "grok, vibe", "the same seats, later")
     check("after the join window the same seats get a new task",
           r8.get("task") and r8["task"] != r5.get("task"), (r5.get("task"), r8.get("task")))
+    for task in all_tasks():
+        if task["state"] in TASK_ACTIVE:
+            task_action("owner", "done", task["id"])
+    for path in (Path(tmp) / "data/inbox").glob("*/*.json"):
+        path.unlink()
+    for seat in ("claude", "grok", "vibe"):
+        d.mark_spent(seat, "clear", "claude")
+        d.update_seat(seat, state="idle")
+    first, _ = d.send("owner", "claude, vibe", "fix the warp panel")
+    second, _ = d.send("owner", "claude, vibe", "@task check the task orbit")
+    followup, _ = d.send("owner", "claude, vibe", "include open tasks")
+    a, b = load_task(first["task"]), load_task(second["task"])
+    check("a separate rapid request goes to a free candidate while its follow-up stays with it",
+          a["holder"] == "claude" and b["holder"] == "vibe"
+          and b["summary"] == "check the task orbit" and followup["task"] == b["id"],
+          (a, b, followup))
+    check("the new holder receives the original request and its follow-up",
+          {second["id"], followup["id"]} <= {r["id"] for _, r in d.pending("vibe")})
     print("\n" + ("all passed" if not failures else f"{len(failures)} failed"))
     return 1 if failures else 0
 
